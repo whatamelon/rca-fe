@@ -1,0 +1,196 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['dev', 'prod']
+env:
+  BUILD_ENV: ${{ github.REF_NAME == 'prod' && 'production' || 'development' }}
+
+jobs:
+  prepare:
+    name: Prepare Build
+    runs-on: self-hosted
+
+    outputs:
+      IMAGE_NAME: ${{ steps.tag.outputs.IMAGE_NAME }}
+      IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+      LATEST_IMAGE_NAME: ${{ steps.tag.outputs.LATEST_IMAGE_NAME }}
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Get time TAG
+        id: tag
+        run: |
+          BUILD_DATE=$(date +'%Y%m%d.%H%M')
+          GIT_HASH=$(git rev-parse --short HEAD)
+          echo "IMAGE_TAG=$BUILD_DATE.$GIT_HASH.${{ github.REF_NAME }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_NAME=${{ vars.REPOSITORY_URL }}:$BUILD_DATE.$GIT_HASH.${{ github.REF_NAME }}"  >> $GITHUB_OUTPUT
+          echo "LATEST_IMAGE_NAME=${{ vars.REPOSITORY_URL }}:latest"  >> $GITHUB_OUTPUT
+  build:
+    name: Docker Build & Push
+    runs-on: self-hosted
+    needs: prepare
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActions
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Set Pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install Pnpm
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build GO
+        env:
+          BUILD_ENV: ${{ env.BUILD_ENV }}
+        run: pnpm build:${BUILD_ENV}
+
+      - name: Build, tag, and push docker image to Amazon ECR
+        id: docker
+        env:
+          IMAGE_NAME: ${{ needs.prepare.outputs.IMAGE_NAME }}
+          LATEST_IMAGE_NAME: ${{ needs.prepare.outputs.LATEST_IMAGE_NAME }}
+          BUILD_ENV: ${{ env.BUILD_ENV }}
+        run: |
+          # latest tag 로 docker build
+          # docker build --build-arg="BUILD_ENV=${BUILD_ENV}" -t $IMAGE_NAME .
+          docker build --build-arg="BUILD_ENV=${BUILD_ENV}" -t $LATEST_IMAGE_NAME .
+
+          # 생성된 image 에 최종 tag(name) 추가
+          docker tag $LATEST_IMAGE_NAME $IMAGE_NAME
+
+          # latest 와 최종 image 각각 push
+          docker push $LATEST_IMAGE_NAME
+          docker push $IMAGE_NAME
+
+  deploy:
+    name: Deploy to Config Repository
+    runs-on: self-hosted
+    needs: [prepare, build]
+    env:
+      BRANCH_NAME: relay3-eks-v2
+      IMAGE_TAG: ${{ needs.prepare.outputs.IMAGE_TAG }}
+      APP_DIR: apps/${{ github.REF_NAME }}/rca-fe
+      REPO_PATH: relay-infra
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          repository: mmemory-relay3/relay-infra
+          ref: ${{ env.BRANCH_NAME }}
+          token: ${{ secrets.CONFIG_GIT_TOKEN }}
+          path: ${{ env.REPO_PATH }}
+      - name: Update Image Tag
+        uses: mikefarah/yq@master
+        with:
+          cmd: TAG=${{ env.IMAGE_TAG }} yq -i '.image.tag = strenv(TAG)' ${{ env.REPO_PATH }}/${{ env.APP_DIR }}/values.yaml
+
+      - name: Commit Resources
+        run: |
+          cd ${{ env.REPO_PATH }}/${{ env.APP_DIR }}
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "github-actions"
+          git commit -am "Update image tag"
+          git push -u origin ${{ env.BRANCH_NAME }}
+
+  slackNotification:
+    name: Slack Notification
+    runs-on: self-hosted
+    if: github.ref_name == 'prod'
+    needs: [prepare, build, deploy]
+    env:
+      IMAGE_NAME: ${{ needs.prepare.outputs.IMAGE_NAME }}
+    steps:
+      - name: prepare
+        id: slack_prepare
+        run: |
+          echo "BUILD_RESULT=$(if [ ${{ needs.deploy.result }} = 'success' ]; then echo "✅ 빌드가 성공하였습니다."; else echo "❌ 빌드가 실패하였습니다."; fi;)" >> $GITHUB_ENV
+          echo "GIT_URL=${{ github.event.pull_request.html_url || github.event.head_commit.url }} " >> $GITHUB_ENV
+      - name: Post Build Result to a Slack channel
+        id: post_result_to_slack
+        run: |
+          echo "BUILD RESULT=${{ env.BUILD_RESULT }}"
+          echo "IMAGE_NAME=${{ env.IMAGE_NAME }}"
+          echo "GIT_URL=${{ env.GIT_URL }}"
+
+          curl --location 'https://slack.com/api/chat.postMessage' \
+          --header 'Content-Type: application/json' \
+          --header 'Authorization: Bearer ${{ secrets.SLACK_BOT_TOKEN }}' \
+          --data '
+            {
+              "channel": "${{ vars.SLACK_CHANNEL_ID }}",
+              "text": "${{ github.repository }} ${{ env.BUILD_RESULT }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ env.BUILD_RESULT }}",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*${{ github.repository }}/${{ github.ref_name }}*"
+                  },
+                  "accessory": {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "깃헙 링크 :anchor:️",
+                      "emoji": true
+                    },
+                    "value": "click_me_123",
+                    "url": "${{ github.event.pull_request.html_url || github.event.head_commit.url }}",
+                    "action_id": "button-action"
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Commit*: ${{ github.event.head_commit.message }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Image ID*: ${{ env.IMAGE_NAME }}"
+                    }
+                  ]
+                }
+              ]
+            }'

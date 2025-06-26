@@ -1,0 +1,35 @@
+/* EXTEND CSS */
+/* Add css variables in exist utilities */
+
+@theme {
+  /* WIDTH */
+  --width-22: '88px';
+  --width-30: '120px';
+  --width-pc: '375px';
+
+  /* HEIGHT */
+  --height-12_5: '50px';
+  --height-13: '3.25rem';
+  --height-16: '64px';
+  --height-18: '72px';
+  --height-22: '88px';
+
+  /* SPACING */
+  --spacing-15: '60px';
+
+  /* LINE HEIGHT */
+  --leading-label: '8px';
+  --leading-16: '16px';
+  --leading-18: '18px';
+  --leading-20: '20px';
+  --leading-22: '22px';
+  --leading-24: '24px';
+  --leading-28: '28px';
+  --leading-30: '30px';
+  --leading-32: '32px';
+  --leading-34: '34px';
+  --leading-38: '38px';
+  --leading-42: '42px';
+  --leading-46: '46px';
+  --leading-52: '52px';
+}
